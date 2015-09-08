@@ -1,0 +1,22 @@
+CACHE MANIFEST
+# generated on Tue, 08 Sep 2015 15:31:33 +0000
+
+CACHE:
+slave.html
+slave.js
+gadget_officejs_webrtc_jio.html
+gadget_officejs_webrtc_jio.js
+gadget_jio.html
+gadget_jio.js
+jiodev.js
+gadget_websocket.html
+gadget_websocket.js
+gadget_webrtc_datachannel.html
+gadget_webrtc_datachannel.js
+gadget_webrtc.html
+gadget_webrtc.js
+
+NETWORK:
+*
+#https://nexedi.erp5.net/rsvp.js
+#https://nexedi.erp5.net/renderjs.js
