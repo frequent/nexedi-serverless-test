@@ -668,6 +668,11 @@ define("rsvp/promise",
           then = value.then;
 
           if (isFunction(then)) {
+            if (isFunction(value.on)) {
+              value.on('promise:notified', function (event) {
+                notify(promise, event.detail);
+              });
+            }
             promise.on('promise:cancelled', function(event) {
               if (isFunction(value.cancel)) {
                 value.cancel();
@@ -730,11 +735,11 @@ define("rsvp/promise",
     __exports__.Promise = Promise;
   });
 define("rsvp/queue",
-  ["rsvp/promise","rsvp/timeout","exports"],
+  ["rsvp/promise","rsvp/resolve","exports"],
   function(__dependency1__, __dependency2__, __exports__) {
     "use strict";
     var Promise = __dependency1__.Promise;
-    var delay = __dependency2__.delay;
+    var resolve = __dependency2__.resolve;
 
     // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error
     function ResolvedQueueError(message) {
@@ -753,6 +758,7 @@ define("rsvp/queue",
         promise,
         fulfill,
         reject,
+        notify,
         resolved;
 
       if (!(this instanceof Queue)) {
@@ -765,7 +771,7 @@ define("rsvp/queue",
         }
       }
 
-      promise = new Promise(function(done, fail) {
+      promise = new Promise(function(done, fail, progress) {
         fulfill = function (fulfillmentValue) {
           if (resolved) {return;}
           queue.isFulfilled = true;
@@ -780,9 +786,10 @@ define("rsvp/queue",
           resolved = true;
           return fail(rejectedReason);
         };
+        notify = progress;
       }, canceller);
 
-      promise_list.push(delay());
+      promise_list.push(resolve());
       promise_list.push(promise_list[0].then(function () {
         promise_list.splice(0, 2);
         if (promise_list.length === 0) {
@@ -803,7 +810,7 @@ define("rsvp/queue",
         return promise.then.apply(promise, arguments);
       };
 
-      queue.push = function(done, fail) {
+      queue.push = function(done, fail, progress) {
         var last_promise = promise_list[promise_list.length - 1],
           next_promise;
 
@@ -811,11 +818,11 @@ define("rsvp/queue",
           throw new ResolvedQueueError();
         }
 
-        next_promise = last_promise.then(done, fail);
+        next_promise = last_promise.then(done, fail, progress);
         promise_list.push(next_promise);
 
         // Handle pop
-        promise_list.push(next_promise.then(function (fulfillmentValue) {
+        last_promise = next_promise.then(function (fulfillmentValue) {
           promise_list.splice(0, 2);
           if (promise_list.length === 0) {
             fulfill(fulfillmentValue);
@@ -829,7 +836,13 @@ define("rsvp/queue",
           } else {
             throw rejectedReason;
           }
-        }));
+        }, function (notificationValue) {
+          if (promise_list[promise_list.length - 1] === last_promise) {
+            notify(notificationValue);
+          }
+          return notificationValue;
+        });
+        promise_list.push(last_promise);
 
         return this;
       };
