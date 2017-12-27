@@ -3,96 +3,113 @@
 (function (rJS, window, RSVP) {
   "use strict";
 
-  var connection_options = [
-      {
-        // No need for stun server on the same lan / ipv6
-        iceServers: []
-      },
-      {
-        'optional': [{DtlsSrtpKeyAgreement: true}]
-      }
-    ],
-    data_channel_options = {reliable: true},
-    offer_contraints = {
-      mandatory: {
-        OfferToReceiveAudio: false,
-        OfferToReceiveVideo: false
-      }
-    };
+  /////////////////////////////////////////////////////////////////
+  // some variables
+  /////////////////////////////////////////////////////////////////
+
+  var DATA_CHANNEL_OPTION_DICT = {reliable: true};
+  var CONNECT_OPTION_LIST = [
+    {iceServers: []},
+    {optional: [{DtlsSrtpKeyAgreement: true}]}
+  ];
+  var OFFER_CONSTRAINT_DICT = {
+    mandatory: {
+      OfferToReceiveAudio: false,
+      OfferToReceiveVideo: false
+    }
+  };
 
   rJS(window)
+    
+    /////////////////////////////////////////////////////////////////
+    // ready
+    /////////////////////////////////////////////////////////////////
     .ready(function (g) {
-      g.props = {};
-      return g.getDeclaredGadget('webrtc')
-        .push(function (gadget) {
-          g.props.webrtc = gadget;
-          g.props.description_defer = RSVP.defer();
-          g.props.channel_defer = RSVP.defer();
-        });
+      this.state_parameter_dict = {};
     })
 
+    /////////////////////////////////////////////////////////////////
+    // published methods
+    /////////////////////////////////////////////////////////////////
     .allowPublicAcquisition("notifyDescriptionCalculated", function (args) {
-      this.props.description_defer.resolve(args[0]);
+      this.state_parameter_dict.description_defer.resolve(args[0]);
     })
 
     .allowPublicAcquisition("notifyDataChannelOpened", function () {
-      this.props.channel_defer.resolve();
+      this.state_parameter_dict.channel_defer.resolve();
     })
 
+    /////////////////////////////////////////////////////////////////
+    // declared methods
+    /////////////////////////////////////////////////////////////////
     .declareMethod('createOffer', function (title) {
       var gadget = this,
-        webrtc = this.props.webrtc;
-      return webrtc.createConnection.apply(webrtc, connection_options)
+        dict = gadget.state_parameter_dict,
+        webrtc = dict.webrtc;
+      return webrtc.createConnection.apply(webrtc, CONNECT_OPTION_LIST)
         .push(function () {
-          return webrtc.createDataChannel(title, data_channel_options);
+          return webrtc.createDataChannel(title, DATA_CHANNEL_OPTION_DICT);
         })
         .push(function () {
-          return webrtc.createOffer(offer_contraints);
+          return webrtc.createOffer(OFFER_CONSTRAINT_DICT);
         })
         .push(function (local_description) {
           return webrtc.setLocalDescription(local_description);
         })
         .push(function () {
-          return gadget.props.description_defer.promise;
+          return dict.description_defer.promise;
         });
     })
 
     .declareMethod('registerAnswer', function (description) {
-      var gadget = this;
-      return gadget.props.webrtc.setRemoteDescription(description)
+      var gadget = this,
+        dict = gadget.state_parameter_dict;
+      return dict.webrtc.setRemoteDescription(description)
         .push(function () {
-          return gadget.props.channel_defer.promise;
+          return dict.channel_defer.promise;
         });
     })
 
     .declareMethod('createAnswer', function (title, description) {
       var gadget = this,
-        webrtc = this.props.webrtc;
-      return webrtc.createConnection.apply(webrtc, connection_options)
+        dict = gadget.state_parameter_dict,
+        webrtc = dict.webrtc;
+      return webrtc.createConnection.apply(webrtc, CONNECT_OPTION_LIST)
         .push(function () {
           return webrtc.setRemoteDescription(description);
         })
         .push(function () {
-          return webrtc.createAnswer(offer_contraints);
+          return webrtc.createAnswer(OFFER_CONSTRAINT_DICT);
         })
         .push(function (local_description) {
           return webrtc.setLocalDescription(local_description);
         })
         .push(function () {
-          return gadget.props.description_defer.promise;
+          return dict.description_defer.promise;
         });
     })
 
     .declareMethod('waitForConnection', function () {
-      return this.props.channel_defer.promise;
+      return this.state_parameter_dict.channel_defer.promise;
     })
 
     .declareMethod('send', function () {
-      var webrtc = this.props.webrtc;
-      return webrtc.send.apply(
-        webrtc,
-        arguments
-      );
+      var webrtc = this.state_parameter_dict.webrtc;
+      return webrtc.send.apply(webrtc, arguments);
+    })
+
+    /////////////////////////////////////////////////////////////////
+    // declared services
+    /////////////////////////////////////////////////////////////////
+    .declareService(function () {
+      var gadget = this,
+        dict = gadget.state_parameter_dict;
+      return gadget.getDeclaredGadget('webrtc')
+        .push(function (webrtc_gadget) {
+          dict.webrtc = webrtc_gadget;
+          dict.description_defer = RSVP.defer();
+          dict.channel_defer = RSVP.defer();
+        });
     });
 
 }(rJS, window, RSVP));

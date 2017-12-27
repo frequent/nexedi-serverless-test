@@ -666,59 +666,14 @@ if (typeof document.contains !== 'function') {
  }
 }
 ;/*! RenderJs */
-/*global console*/
 /*jslint nomen: true*/
-function loopEventListener(target, type, useCapture, callback) {
-  "use strict";
-  //////////////////////////
-  // Infinite event listener (promise is never resolved)
-  // eventListener is removed when promise is cancelled/rejected
-  //////////////////////////
-  var handle_event_callback,
-    callback_promise;
-
-  function cancelResolver() {
-    if ((callback_promise !== undefined) &&
-        (typeof callback_promise.cancel === "function")) {
-      callback_promise.cancel();
-    }
-  }
-
-  function canceller() {
-    if (handle_event_callback !== undefined) {
-      target.removeEventListener(type, handle_event_callback, useCapture);
-    }
-    cancelResolver();
-  }
-  function itsANonResolvableTrap(resolve, reject) {
-
-    handle_event_callback = function (evt) {
-      evt.stopPropagation();
-      evt.preventDefault();
-      cancelResolver();
-      callback_promise = new RSVP.Queue()
-        .push(function () {
-          return callback(evt);
-        })
-        .push(undefined, function (error) {
-          if (!(error instanceof RSVP.CancellationError)) {
-            canceller();
-            reject(error);
-          }
-        });
-    };
-
-    target.addEventListener(type, handle_event_callback, useCapture);
-  }
-  return new RSVP.Promise(itsANonResolvableTrap, canceller);
-}
 
 /*
  * renderJs - Generic Gadget library renderer.
  * http://www.renderjs.org/documentation
  */
 (function (document, window, RSVP, DOMParser, Channel, MutationObserver,
-           Node, FileReader, Blob) {
+           Node, FileReader, Blob, navigator, Event, URL) {
   "use strict";
 
   function readBlobAsDataURL(blob) {
@@ -732,6 +687,79 @@ function loopEventListener(target, type, useCapture, callback) {
     }, function () {
       fr.abort();
     });
+  }
+
+  function loopEventListener(target, type, useCapture, callback,
+                             prevent_default) {
+    //////////////////////////
+    // Infinite event listener (promise is never resolved)
+    // eventListener is removed when promise is cancelled/rejected
+    //////////////////////////
+    var handle_event_callback,
+      callback_promise;
+
+    if (prevent_default === undefined) {
+      prevent_default = true;
+    }
+
+    function cancelResolver() {
+      if ((callback_promise !== undefined) &&
+          (typeof callback_promise.cancel === "function")) {
+        callback_promise.cancel();
+      }
+    }
+
+    function canceller() {
+      if (handle_event_callback !== undefined) {
+        target.removeEventListener(type, handle_event_callback, useCapture);
+      }
+      cancelResolver();
+    }
+    function itsANonResolvableTrap(resolve, reject) {
+      var result;
+      handle_event_callback = function (evt) {
+        if (prevent_default) {
+          evt.stopPropagation();
+          evt.preventDefault();
+        }
+
+        cancelResolver();
+
+        try {
+          result = callback(evt);
+        } catch (e) {
+          result = RSVP.reject(e);
+        }
+
+        callback_promise = result;
+        new RSVP.Queue()
+          .push(function () {
+            return result;
+          })
+          .push(undefined, function (error) {
+            if (!(error instanceof RSVP.CancellationError)) {
+              canceller();
+              reject(error);
+            }
+          });
+      };
+
+      target.addEventListener(type, handle_event_callback, useCapture);
+    }
+    return new RSVP.Promise(itsANonResolvableTrap, canceller);
+  }
+
+  function promiseAnimationFrame() {
+    var request_id;
+
+    function canceller() {
+      window.cancelAnimationFrame(request_id);
+    }
+
+    function resolver(resolve) {
+      request_id = window.requestAnimationFrame(resolve);
+    }
+    return new RSVP.Promise(resolver, canceller);
   }
 
   function ajax(url) {
@@ -774,83 +802,31 @@ function loopEventListener(target, type, useCapture, callback) {
     return new RSVP.Promise(resolver, canceller);
   }
 
-  var gadget_model_dict = {},
+  var gadget_model_defer_dict = {},
     javascript_registration_dict = {},
     stylesheet_registration_dict = {},
-    gadget_loading_klass,
-    loading_klass_promise,
+    gadget_loading_klass_list = [],
     renderJS,
     Monitor,
-    isAbsoluteOrDataURL = new RegExp('^(?:[a-z]+:)?//|data:', 'i');
+    scope_increment = 0,
+    isAbsoluteOrDataURL = new RegExp('^(?:[a-z]+:)?//|data:', 'i'),
+    is_page_unloaded = false,
+    error_list = [],
+    all_dependency_loaded_deferred;
+
+  window.addEventListener('error', function (error) {
+    error_list.push(error);
+  });
+
+  window.addEventListener('beforeunload', function () {
+    // XXX If another listener cancel the page unload,
+    // it will not restore renderJS crash report
+    is_page_unloaded = true;
+  });
 
   /////////////////////////////////////////////////////////////////
   // Helper functions
   /////////////////////////////////////////////////////////////////
-  function listenHashChange(gadget) {
-
-    function extractHashAndDispatch(evt) {
-      var hash = (evt.newURL || window.location.toString()).split('#')[1],
-        subhashes,
-        subhash,
-        keyvalue,
-        index,
-        options = {};
-      if (hash === undefined) {
-        hash = "";
-      } else {
-        hash = hash.split('?')[0];
-      }
-
-      function optionalize(key, value, dict) {
-        var key_list = key.split("."),
-          kk,
-          i;
-        for (i = 0; i < key_list.length; i += 1) {
-          kk = key_list[i];
-          if (i === key_list.length - 1) {
-            dict[kk] = value;
-          } else {
-            if (!dict.hasOwnProperty(kk)) {
-              dict[kk] = {};
-            }
-            dict = dict[kk];
-          }
-        }
-      }
-
-      subhashes = hash.split('&');
-      for (index in subhashes) {
-        if (subhashes.hasOwnProperty(index)) {
-          subhash = subhashes[index];
-          if (subhash !== '') {
-            keyvalue = subhash.split('=');
-            if (keyvalue.length === 2) {
-
-              optionalize(decodeURIComponent(keyvalue[0]),
-                decodeURIComponent(keyvalue[1]),
-                options);
-
-            }
-          }
-        }
-      }
-
-      if (gadget.render !== undefined) {
-        return gadget.render(options);
-      }
-    }
-
-    var result = loopEventListener(window, 'hashchange', false,
-                                   extractHashAndDispatch),
-      event = document.createEvent("Event");
-
-    event.initEvent('hashchange', true, true);
-    event.newURL = window.location.toString();
-    window.dispatchEvent(event);
-    return result;
-  }
-
-
   function removeHash(url) {
     var index = url.indexOf('#');
     if (index > 0) {
@@ -860,23 +836,111 @@ function loopEventListener(target, type, useCapture, callback) {
   }
 
   function letsCrash(e) {
-    if (e.constructor === XMLHttpRequest) {
-      e = {
-        readyState: e.readyState,
-        status: e.status,
-        statusText: e.statusText,
-        response_headers: e.getAllResponseHeaders()
-      };
+    var i,
+      body,
+      container,
+      paragraph,
+      link,
+      error;
+    if (is_page_unloaded) {
+      /*global console*/
+      console.info('-- Error dropped, as page is unloaded');
+      console.info(e);
+      return;
     }
-    if (e.constructor === Array ||
-        e.constructor === String ||
-        e.constructor === Object) {
-      try {
-        e = JSON.stringify(e);
-      } catch (ignore) {
+
+    error_list.push(e);
+    // Add error handling stack
+    error_list.push(new Error('stopping renderJS'));
+
+    body = document.getElementsByTagName('body')[0];
+    while (body.firstChild) {
+      body.removeChild(body.firstChild);
+    }
+
+    container = document.createElement("section");
+    paragraph = document.createElement("h1");
+    paragraph.textContent = 'Unhandled Error';
+    container.appendChild(paragraph);
+
+    paragraph = document.createElement("p");
+    paragraph.textContent = 'Please report this error to the support team';
+    container.appendChild(paragraph);
+
+    paragraph = document.createElement("p");
+    paragraph.textContent = 'Location: ';
+    link = document.createElement("a");
+    link.href = link.textContent = window.location.toString();
+    paragraph.appendChild(link);
+    container.appendChild(paragraph);
+
+    paragraph = document.createElement("p");
+    paragraph.textContent = 'User-agent: ' + navigator.userAgent;
+    container.appendChild(paragraph);
+
+    paragraph = document.createElement("p");
+    paragraph.textContent = 'Date: ' + new Date(Date.now()).toISOString();
+    container.appendChild(paragraph);
+
+    body.appendChild(container);
+
+    for (i = 0; i < error_list.length; i += 1) {
+      error = error_list[i];
+
+      if (error instanceof Event) {
+        error = {
+          string: error.toString(),
+          message: error.message,
+          type: error.type,
+          target: error.target
+        };
+        if (error.target !== undefined) {
+          error_list.splice(i + 1, 0, error.target);
+        }
       }
+
+      if (error instanceof XMLHttpRequest) {
+        error = {
+          message: error.toString(),
+          readyState: error.readyState,
+          status: error.status,
+          statusText: error.statusText,
+          response: error.response,
+          responseUrl: error.responseUrl,
+          response_headers: error.getAllResponseHeaders()
+        };
+      }
+      if (error.constructor === Array ||
+          error.constructor === String ||
+          error.constructor === Object) {
+        try {
+          error = JSON.stringify(error);
+        } catch (ignore) {
+        }
+      }
+
+      container = document.createElement("section");
+
+      paragraph = document.createElement("h2");
+      paragraph.textContent = error.message || error;
+      container.appendChild(paragraph);
+
+      if (error.fileName !== undefined) {
+        paragraph = document.createElement("p");
+        paragraph.textContent = 'File: ' +
+          error.fileName +
+          ': ' + error.lineNumber;
+        container.appendChild(paragraph);
+      }
+
+      if (error.stack !== undefined) {
+        paragraph = document.createElement("pre");
+        paragraph.textContent = 'Stack: ' + error.stack;
+        container.appendChild(paragraph);
+      }
+
+      body.appendChild(container);
     }
-    document.getElementsByTagName('body')[0].textContent = e;
     // XXX Do not crash the application if it fails
     // Where to write the error?
     /*global console*/
@@ -1017,6 +1081,9 @@ function loopEventListener(target, type, useCapture, callback) {
       g.__monitor.cancel();
     }
     g.__monitor = new Monitor();
+    g.__job_dict = {};
+    g.__job_list = [];
+    g.__job_triggered = false;
     g.__monitor.fail(function (error) {
       if (!(error instanceof RSVP.CancellationError)) {
         return g.aq_reportServiceError(error);
@@ -1027,31 +1094,47 @@ function loopEventListener(target, type, useCapture, callback) {
     });
   }
 
-  function clearGadgetInternalParameters(g) {
-    g.__sub_gadget_dict = {};
-    createMonitor(g);
+  function clearGadgetInternalParameters() {
+    this.__sub_gadget_dict = {};
+    createMonitor(this);
   }
 
-  function loadSubGadgetDOMDeclaration(g) {
-    var element_list = g.__element.querySelectorAll('[data-gadget-scope]'),
+  function loadSubGadgetDOMDeclaration() {
+    var element_list = this.element.querySelectorAll('[data-gadget-url]'),
       element,
       promise_list = [],
       scope,
       url,
       sandbox,
-      i;
+      i,
+      context = this;
+
+    function prepareReportGadgetDeclarationError(scope) {
+      return function (error) {
+        var aq_dict = context.__acquired_method_dict || {},
+          method_name = 'reportGadgetDeclarationError';
+        if (aq_dict.hasOwnProperty(method_name)) {
+          return aq_dict[method_name].apply(context,
+                                            [arguments, scope]);
+        }
+        throw error;
+      };
+    }
 
     for (i = 0; i < element_list.length; i += 1) {
       element = element_list[i];
       scope = element.getAttribute("data-gadget-scope");
       url = element.getAttribute("data-gadget-url");
       sandbox = element.getAttribute("data-gadget-sandbox");
-      if ((scope !== null) && (url !== null)) {
-        promise_list.push(g.declareGadget(url, {
-          element: element,
-          scope: scope || undefined,
-          sandbox: sandbox || undefined
-        }));
+      if (url !== null) {
+        promise_list.push(
+          context.declareGadget(url, {
+            element: element,
+            scope: scope || undefined,
+            sandbox: sandbox || undefined
+          })
+            .push(undefined, prepareReportGadgetDeclarationError(scope))
+        );
       }
     }
 
@@ -1064,24 +1147,118 @@ function loopEventListener(target, type, useCapture, callback) {
     this.__ready_list.push(callback);
     return this;
   };
+  RenderJSGadget.setState = function (state_dict) {
+    var json_state = JSON.stringify(state_dict);
+    this.__ready_list.unshift(function () {
+      this.state = JSON.parse(json_state);
+    });
+    return this;
+  };
+  RenderJSGadget.onStateChange = function (callback) {
+    this.prototype.__state_change_callback = callback;
+    return this;
+  };
 
   RenderJSGadget.__service_list = [];
   RenderJSGadget.declareService = function (callback) {
     this.__service_list.push(callback);
     return this;
   };
+  RenderJSGadget.onEvent = function (type, callback, use_capture,
+                                     prevent_default) {
+    this.__service_list.push(function () {
+      return loopEventListener(this.element, type, use_capture,
+                               callback.bind(this), prevent_default);
+    });
+    return this;
+  };
+
+  RenderJSGadget.onLoop = function (callback, delay) {
+    if (delay === undefined) {
+      delay = 0;
+    }
+    this.__service_list.push(function () {
+      var queue_loop = new RSVP.Queue(),
+        context = this,
+        wait = function () {
+          queue_loop
+            .push(function () {
+              return RSVP.delay(delay);
+            })
+            .push(function () {
+              // Only loop when the app has the focus
+              return promiseAnimationFrame();
+            })
+            .push(function () {
+              return callback.apply(context, []);
+            })
+            .push(function () {
+              wait();
+            });
+        };
+      wait();
+      return queue_loop;
+    });
+    return this;
+  };
+
+  function runJob(gadget, name, callback, argument_list) {
+    var job_promise = new RSVP.Queue()
+      .push(function () {
+        return callback.apply(gadget, argument_list);
+      });
+    if (gadget.__job_dict.hasOwnProperty(name)) {
+      gadget.__job_dict[name].cancel();
+    }
+    gadget.__job_dict[name] = job_promise;
+    gadget.__monitor.monitor(new RSVP.Queue()
+      .push(function () {
+        return job_promise;
+      })
+      .push(undefined, function (error) {
+        if (!(error instanceof RSVP.CancellationError)) {
+          throw error;
+        }
+      }));
+  }
 
   function startService(gadget) {
     gadget.__monitor.monitor(new RSVP.Queue()
       .push(function () {
         var i,
-          service_list = gadget.constructor.__service_list;
+          service_list = gadget.constructor.__service_list,
+          job_list = gadget.__job_list;
         for (i = 0; i < service_list.length; i += 1) {
           gadget.__monitor.monitor(service_list[i].apply(gadget));
         }
+        for (i = 0; i < job_list.length; i += 1) {
+          runJob(gadget, job_list[i][0], job_list[i][1], job_list[i][2]);
+        }
+        gadget.__job_list = [];
+        gadget.__job_triggered = true;
       })
       );
   }
+
+  /////////////////////////////////////////////////////////////////
+  // RenderJSGadget.declareJob
+  // gadget internal method, which trigger execution
+  // of a function inside a service
+  /////////////////////////////////////////////////////////////////
+  RenderJSGadget.declareJob = function (name, callback) {
+    this.prototype[name] = function () {
+      var context = this,
+        argument_list = arguments;
+
+      if (context.__job_triggered) {
+        runJob(context, name, callback, argument_list);
+      } else {
+        context.__job_list.push([name, callback, argument_list]);
+      }
+    };
+    // Allow chain
+    return this;
+  };
 
   /////////////////////////////////////////////////////////////////
   // RenderJSGadget.declareMethod
@@ -1123,10 +1300,60 @@ function loopEventListener(target, type, useCapture, callback) {
     })
     .declareMethod('getElement', function () {
       // Returns the DOM Element of a gadget
-      if (this.__element === undefined) {
+      // XXX Kept for compatibility. Use element property directly
+      if (this.element === undefined) {
         throw new Error("No element defined");
       }
-      return this.__element;
+      return this.element;
+    })
+    .declareMethod('changeState', function (state_dict) {
+      var next_onStateChange = new RSVP.Queue(),
+        previous_onStateCHange,
+        context = this;
+      if (context.hasOwnProperty('__previous_onStateChange')) {
+        previous_onStateCHange = context.__previous_onStateChange;
+        next_onStateChange
+          .push(function () {
+            return previous_onStateCHange;
+          })
+          .push(undefined, function () {
+            // Run callback even if previous failed
+            return;
+          });
+      }
+      context.__previous_onStateChange = next_onStateChange;
+      return next_onStateChange
+        .push(function () {
+          var key,
+            modified = false,
+            previous_cancelled = context.hasOwnProperty('__modification_dict'),
+            modification_dict;
+          if (previous_cancelled) {
+            modification_dict = context.__modification_dict;
+            modified = true;
+          } else {
+            modification_dict = {};
+          }
+          for (key in state_dict) {
+            if (state_dict.hasOwnProperty(key) &&
+                (state_dict[key] !== context.state[key])) {
+              context.state[key] = state_dict[key];
+              modification_dict[key] = state_dict[key];
+              modified = true;
+            }
+          }
+          if (modified && context.__state_change_callback !== undefined) {
+            context.__modification_dict = modification_dict;
+            return new RSVP.Queue()
+              .push(function () {
+                return context.__state_change_callback(modification_dict);
+              })
+              .push(function (result) {
+                delete context.__modification_dict;
+                return result;
+              });
+          }
+        });
     });
 
   /////////////////////////////////////////////////////////////////
@@ -1180,8 +1407,8 @@ function loopEventListener(target, type, useCapture, callback) {
     };
   RenderJSGadget.declareAcquiredMethod("aq_reportServiceError",
                                        "reportServiceError");
-  RenderJSGadget.declareAcquiredMethod("aq_pleasePublishMyState",
-                                       "pleasePublishMyState");
+  RenderJSGadget.declareAcquiredMethod("aq_reportGadgetDeclarationError",
+                                       "reportGadgetDeclarationError");
 
   /////////////////////////////////////////////////////////////////
   // RenderJSGadget.allowPublicAcquisition
@@ -1202,22 +1429,6 @@ function loopEventListener(target, type, useCapture, callback) {
     };
   }
 
-  function pleasePublishMyState(param_list, child_gadget_scope) {
-    var new_param = {},
-      key;
-    for (key in this.state_parameter_dict) {
-      if (this.state_parameter_dict.hasOwnProperty(key)) {
-        new_param[key] = this.state_parameter_dict[key];
-      }
-    }
-    if (child_gadget_scope === undefined) {
-      throw new Error("gadget scope is mandatory");
-    }
-    new_param[child_gadget_scope] = param_list[0];
-    param_list = [new_param];
-    return this.aq_pleasePublishMyState.apply(this, param_list);
-  }
-
   /////////////////////////////////////////////////////////////////
   // RenderJSEmbeddedGadget
   /////////////////////////////////////////////////////////////////
@@ -1233,8 +1444,16 @@ function loopEventListener(target, type, useCapture, callback) {
     RenderJSGadget.__service_list.slice();
   RenderJSEmbeddedGadget.ready =
     RenderJSGadget.ready;
+  RenderJSEmbeddedGadget.setState =
+    RenderJSGadget.setState;
+  RenderJSEmbeddedGadget.onStateChange =
+    RenderJSGadget.onStateChange;
   RenderJSEmbeddedGadget.declareService =
     RenderJSGadget.declareService;
+  RenderJSEmbeddedGadget.onEvent =
+    RenderJSGadget.onEvent;
+  RenderJSEmbeddedGadget.onLoop =
+    RenderJSGadget.onLoop;
   RenderJSEmbeddedGadget.prototype = new RenderJSGadget();
   RenderJSEmbeddedGadget.prototype.constructor = RenderJSEmbeddedGadget;
 
@@ -1242,55 +1461,37 @@ function loopEventListener(target, type, useCapture, callback) {
   // privateDeclarePublicGadget
   /////////////////////////////////////////////////////////////////
   function privateDeclarePublicGadget(url, options, parent_gadget) {
-    var gadget_instance;
-    if (options.element === undefined) {
-      options.element = document.createElement("div");
-    }
-
-    function loadDependency(method, url) {
-      return function () {
-        return method(url);
-      };
-    }
 
     return new RSVP.Queue()
       .push(function () {
-        return renderJS.declareGadgetKlass(url);
+        return renderJS.declareGadgetKlass(url)
+          // gadget loading should not be interrupted
+          // if not, gadget's definition will not be complete
+          //.then will return another promise
+          //so loading_klass_promise can't be cancel
+          .then(function (result) {
+            return result;
+          });
       })
       // Get the gadget class and instanciate it
       .push(function (Klass) {
+        if (options.element === undefined) {
+          options.element = document.createElement("div");
+        }
         var i,
-          template_node_list = Klass.__template_element.body.childNodes;
-        gadget_loading_klass = Klass;
+          gadget_instance,
+          template_node_list = Klass.__template_element.body.childNodes,
+          fragment = document.createDocumentFragment();
         gadget_instance = new Klass();
-        gadget_instance.__element = options.element;
+        gadget_instance.element = options.element;
+        gadget_instance.state = {};
         for (i = 0; i < template_node_list.length; i += 1) {
-          gadget_instance.__element.appendChild(
+          fragment.appendChild(
             template_node_list[i].cloneNode(true)
           );
         }
+        gadget_instance.element.appendChild(fragment);
         setAqParent(gadget_instance, parent_gadget);
-        // Load dependencies if needed
-        return RSVP.all([
-          gadget_instance.getRequiredJSList(),
-          gadget_instance.getRequiredCSSList()
-        ]);
-      })
-      // Load all JS/CSS
-      .push(function (all_list) {
-        var q = new RSVP.Queue(),
-          i;
-        // Load JS
-        for (i = 0; i < all_list[0].length; i += 1) {
-          q.push(loadDependency(renderJS.declareJS, all_list[0][i]));
-        }
-        // Load CSS
-        for (i = 0; i < all_list[1].length; i += 1) {
-          q.push(loadDependency(renderJS.declareCSS, all_list[1][i]));
-        }
-        return q;
-      })
-      .push(function () {
         return gadget_instance;
       });
   }
@@ -1307,9 +1508,17 @@ function loopEventListener(target, type, useCapture, callback) {
   RenderJSIframeGadget.__ready_list = RenderJSGadget.__ready_list.slice();
   RenderJSIframeGadget.ready =
     RenderJSGadget.ready;
+  RenderJSIframeGadget.setState =
+    RenderJSGadget.setState;
+  RenderJSIframeGadget.onStateChange =
+    RenderJSGadget.onStateChange;
   RenderJSIframeGadget.__service_list = RenderJSGadget.__service_list.slice();
   RenderJSIframeGadget.declareService =
     RenderJSGadget.declareService;
+  RenderJSIframeGadget.onEvent =
+    RenderJSGadget.onEvent;
+  RenderJSIframeGadget.onLoop =
+    RenderJSGadget.onLoop;
   RenderJSIframeGadget.prototype = new RenderJSGadget();
   RenderJSIframeGadget.prototype.constructor = RenderJSIframeGadget;
 
@@ -1334,10 +1543,22 @@ function loopEventListener(target, type, useCapture, callback) {
     gadget_instance = new RenderJSIframeGadget();
     setAqParent(gadget_instance, parent_gadget);
     iframe = document.createElement("iframe");
+    iframe.addEventListener('error', function (error) {
+      iframe_loading_deferred.reject(error);
+    });
+    iframe.addEventListener('load', function () {
+      return RSVP.timeout(5000)
+        .fail(function () {
+          iframe_loading_deferred.reject(
+            new Error('Timeout while loading: ' + url)
+          );
+        });
+    });
 //    gadget_instance.element.setAttribute("seamless", "seamless");
     iframe.setAttribute("src", url);
     gadget_instance.__path = url;
-    gadget_instance.__element = options.element;
+    gadget_instance.element = options.element;
+    gadget_instance.state = {};
     // Attach it to the DOM
     options.element.appendChild(iframe);
 
@@ -1346,7 +1567,8 @@ function loopEventListener(target, type, useCapture, callback) {
     // Create the communication channel with the iframe
     gadget_instance.__chan = Channel.build({
       window: iframe.contentWindow,
-      origin: "*",
+      // origin: (new URL(url, window.location)).origin,
+      origin: '*',
       scope: "renderJS"
     });
 
@@ -1361,12 +1583,8 @@ function loopEventListener(target, type, useCapture, callback) {
                 params: [
                   method_name,
                   Array.prototype.slice.call(argument_list, 0)],
-                success: function (s) {
-                  resolve(s);
-                },
-                error: function (e) {
-                  reject(e);
-                }
+                success: resolve,
+                error: reject
               });
             });
           return new RSVP.Queue()
@@ -1396,12 +1614,7 @@ function loopEventListener(target, type, useCapture, callback) {
       trans.delayReturn(true);
     });
 
-    return RSVP.any([
-      iframe_loading_deferred.promise,
-      // Timeout to prevent non renderJS embeddable gadget
-      // XXX Maybe using iframe.onload/onerror would be safer?
-      RSVP.timeout(5000)
-    ]);
+    return iframe_loading_deferred.promise;
   }
 
   /////////////////////////////////////////////////////////////////
@@ -1436,10 +1649,7 @@ function loopEventListener(target, type, useCapture, callback) {
   /////////////////////////////////////////////////////////////////
   RenderJSGadget
     .declareMethod('declareGadget', function (url, options) {
-      var queue,
-        parent_gadget = this,
-        local_loading_klass_promise,
-        previous_loading_klass_promise = loading_klass_promise;
+      var parent_gadget = this;
 
       if (options === undefined) {
         options = {};
@@ -1450,16 +1660,8 @@ function loopEventListener(target, type, useCapture, callback) {
 
       // transform url to absolute url if it is relative
       url = renderJS.getAbsoluteURL(url, this.__path);
-      // Change the global variable to update the loading queue
-      loading_klass_promise = new RSVP.Queue()
-        // Wait for previous gadget loading to finish first
-        .push(function () {
-          return previous_loading_klass_promise;
-        })
-        .push(undefined, function () {
-          // Forget previous declareGadget error
-          return;
-        })
+
+      return new RSVP.Queue()
         .push(function () {
           var method;
           if (options.sandbox === "public") {
@@ -1476,60 +1678,57 @@ function loopEventListener(target, type, useCapture, callback) {
         })
         // Set the HTML context
         .push(function (gadget_instance) {
-          // Drop the current loading klass info used by selector
-          gadget_loading_klass = undefined;
-          return gadget_instance;
-        })
-        .push(undefined, function (e) {
-          // Drop the current loading klass info used by selector
-          // even in case of error
-          gadget_loading_klass = undefined;
-          throw e;
-        });
-      local_loading_klass_promise = loading_klass_promise;
-
-      queue = new RSVP.Queue()
-        .push(function () {
-          return local_loading_klass_promise;
-        })
-        // Set the HTML context
-        .push(function (gadget_instance) {
-          var i;
+          var i,
+            scope,
+            queue = new RSVP.Queue();
           // Trigger calling of all ready callback
           function ready_wrapper() {
             return gadget_instance;
           }
+          function ready_executable_wrapper(fct) {
+            return function () {
+              return fct.call(gadget_instance, gadget_instance);
+            };
+          }
           for (i = 0; i < gadget_instance.constructor.__ready_list.length;
                i += 1) {
             // Put a timeout?
-            queue.push(gadget_instance.constructor.__ready_list[i]);
+            queue.push(ready_executable_wrapper(
+              gadget_instance.constructor.__ready_list[i]
+            ));
             // Always return the gadget instance after ready function
             queue.push(ready_wrapper);
           }
 
           // Store local reference to the gadget instance
-          if (options.scope !== undefined) {
-            parent_gadget.__sub_gadget_dict[options.scope] = gadget_instance;
-            gadget_instance.__element.setAttribute("data-gadget-scope",
-                                                   options.scope);
+          scope = options.scope;
+          if (scope === undefined) {
+            scope = 'RJS_' + scope_increment;
+            scope_increment += 1;
+            while (parent_gadget.__sub_gadget_dict.hasOwnProperty(scope)) {
+              scope = 'RJS_' + scope_increment;
+              scope_increment += 1;
+            }
           }
+          parent_gadget.__sub_gadget_dict[scope] = gadget_instance;
+          gadget_instance.element.setAttribute("data-gadget-scope",
+                                               scope);
 
           // Put some attribute to ease page layout comprehension
-          gadget_instance.__element.setAttribute("data-gadget-url", url);
-          gadget_instance.__element.setAttribute("data-gadget-sandbox",
-                                                 options.sandbox);
-          gadget_instance.__element._gadget = gadget_instance;
+          gadget_instance.element.setAttribute("data-gadget-url", url);
+          gadget_instance.element.setAttribute("data-gadget-sandbox",
+                                               options.sandbox);
+          gadget_instance.element._gadget = gadget_instance;
 
-          if (document.contains(gadget_instance.__element)) {
+          if (document.contains(gadget_instance.element)) {
             // Put a timeout
             queue.push(startService);
           }
           // Always return the gadget instance after ready function
           queue.push(ready_wrapper);
 
-          return gadget_instance;
+          return queue;
         });
-      return queue;
     })
     .declareMethod('getDeclaredGadget', function (gadget_scope) {
       if (!this.__sub_gadget_dict.hasOwnProperty(gadget_scope)) {
@@ -1553,7 +1752,7 @@ function loopEventListener(target, type, useCapture, callback) {
     if (selector === window) {
       // window is the 'this' value when loading a javascript file
       // In this case, use the current loading gadget constructor
-      result = gadget_loading_klass;
+      result = gadget_loading_klass_list[0];
     }
     if (result === undefined) {
       throw new Error("Unknown selector '" + selector + "'");
@@ -1579,18 +1778,8 @@ function loopEventListener(target, type, useCapture, callback) {
   // renderJS.getAbsoluteURL
   /////////////////////////////////////////////////////////////////
   renderJS.getAbsoluteURL = function (url, base_url) {
-    var doc, base, link,
-      html = "<!doctype><html><head></head></html>";
-
-    if (url && base_url && !isAbsoluteOrDataURL.test(url)) {
-      doc = (new DOMParser()).parseFromString(html, 'text/html');
-      base = doc.createElement('base');
-      link = doc.createElement('link');
-      doc.head.appendChild(base);
-      doc.head.appendChild(link);
-      base.href = base_url;
-      link.href = url;
-      return link.href;
+    if (base_url && url) {
+      return new URL(url, base_url).href;
     }
     return url;
   };
@@ -1598,26 +1787,36 @@ function loopEventListener(target, type, useCapture, callback) {
   /////////////////////////////////////////////////////////////////
   // renderJS.declareJS
   /////////////////////////////////////////////////////////////////
-  renderJS.declareJS = function (url) {
+  renderJS.declareJS = function (url, container, pop) {
+    // https://www.html5rocks.com/en/tutorials/speed/script-loading/
     // Prevent infinite recursion if loading render.js
     // more than once
     var result;
     if (javascript_registration_dict.hasOwnProperty(url)) {
       result = RSVP.resolve();
     } else {
+      javascript_registration_dict[url] = null;
       result = new RSVP.Promise(function (resolve, reject) {
         var newScript;
         newScript = document.createElement('script');
+        newScript.async = false;
         newScript.type = 'text/javascript';
-        newScript.src = url;
         newScript.onload = function () {
-          javascript_registration_dict[url] = null;
+          if (pop === true) {
+            // Drop the current loading klass info used by selector
+            gadget_loading_klass_list.shift();
+          }
           resolve();
         };
         newScript.onerror = function (e) {
+          if (pop === true) {
+            // Drop the current loading klass info used by selector
+            gadget_loading_klass_list.shift();
+          }
           reject(e);
         };
-        document.head.appendChild(newScript);
+        newScript.src = url;
+        container.appendChild(newScript);
       });
     }
     return result;
@@ -1626,7 +1825,7 @@ function loopEventListener(target, type, useCapture, callback) {
   /////////////////////////////////////////////////////////////////
   // renderJS.declareCSS
   /////////////////////////////////////////////////////////////////
-  renderJS.declareCSS = function (url) {
+  renderJS.declareCSS = function (url, container) {
     // https://github.com/furf/jquery-getCSS/blob/master/jquery.getCSS.js
     // No way to cleanly check if a css has been loaded
     // So, always resolve the promise...
@@ -1648,7 +1847,7 @@ function loopEventListener(target, type, useCapture, callback) {
         link.onerror = function (e) {
           reject(e);
         };
-        document.head.appendChild(link);
+        container.appendChild(link);
       });
     }
     return result;
@@ -1657,71 +1856,106 @@ function loopEventListener(target, type, useCapture, callback) {
   /////////////////////////////////////////////////////////////////
   // renderJS.declareGadgetKlass
   /////////////////////////////////////////////////////////////////
-  renderJS.declareGadgetKlass = function (url) {
-    var result;
 
-    function parse(xhr) {
-      var tmp_constructor,
-        key,
-        parsed_html;
-      if (!gadget_model_dict.hasOwnProperty(url)) {
-        // Class inheritance
-        tmp_constructor = function () {
-          RenderJSGadget.call(this);
-        };
-        tmp_constructor.__ready_list = RenderJSGadget.__ready_list.slice();
-        tmp_constructor.__service_list = RenderJSGadget.__service_list.slice();
-        tmp_constructor.declareMethod =
-          RenderJSGadget.declareMethod;
-        tmp_constructor.declareAcquiredMethod =
-          RenderJSGadget.declareAcquiredMethod;
-        tmp_constructor.allowPublicAcquisition =
-          RenderJSGadget.allowPublicAcquisition;
-        tmp_constructor.ready =
-          RenderJSGadget.ready;
-        tmp_constructor.declareService =
-          RenderJSGadget.declareService;
-        tmp_constructor.prototype = new RenderJSGadget();
-        tmp_constructor.prototype.constructor = tmp_constructor;
-        tmp_constructor.prototype.__path = url;
-        tmp_constructor.prototype.__acquired_method_dict = {};
-        tmp_constructor.allowPublicAcquisition("pleasePublishMyState",
-                                               pleasePublishMyState);
-        // https://developer.mozilla.org/en-US/docs/HTML_in_XMLHttpRequest
-        // https://developer.mozilla.org/en-US/docs/Web/API/DOMParser
-        // https://developer.mozilla.org/en-US/docs/Code_snippets/HTML_to_DOM
-        tmp_constructor.__template_element =
-          (new DOMParser()).parseFromString(xhr.responseText, "text/html");
-        parsed_html = renderJS.parseGadgetHTMLDocument(
-          tmp_constructor.__template_element,
-          url
-        );
-        for (key in parsed_html) {
-          if (parsed_html.hasOwnProperty(key)) {
-            tmp_constructor.prototype['__' + key] = parsed_html[key];
-          }
-        }
-
-        gadget_model_dict[url] = tmp_constructor;
+  function parse(xhr, url) {
+    var tmp_constructor,
+      key,
+      parsed_html;
+    // Class inheritance
+    tmp_constructor = function () {
+      RenderJSGadget.call(this);
+    };
+    tmp_constructor.__ready_list = RenderJSGadget.__ready_list.slice();
+    tmp_constructor.__service_list = RenderJSGadget.__service_list.slice();
+    tmp_constructor.declareMethod =
+      RenderJSGadget.declareMethod;
+    tmp_constructor.declareJob =
+      RenderJSGadget.declareJob;
+    tmp_constructor.declareAcquiredMethod =
+      RenderJSGadget.declareAcquiredMethod;
+    tmp_constructor.allowPublicAcquisition =
+      RenderJSGadget.allowPublicAcquisition;
+    tmp_constructor.ready =
+      RenderJSGadget.ready;
+    tmp_constructor.setState =
+      RenderJSGadget.setState;
+    tmp_constructor.onStateChange =
+      RenderJSGadget.onStateChange;
+    tmp_constructor.declareService =
+      RenderJSGadget.declareService;
+    tmp_constructor.onEvent =
+      RenderJSGadget.onEvent;
+    tmp_constructor.onLoop =
+      RenderJSGadget.onLoop;
+    tmp_constructor.prototype = new RenderJSGadget();
+    tmp_constructor.prototype.constructor = tmp_constructor;
+    tmp_constructor.prototype.__path = url;
+    tmp_constructor.prototype.__acquired_method_dict = {};
+    // https://developer.mozilla.org/en-US/docs/HTML_in_XMLHttpRequest
+    // https://developer.mozilla.org/en-US/docs/Web/API/DOMParser
+    // https://developer.mozilla.org/en-US/docs/Code_snippets/HTML_to_DOM
+    tmp_constructor.__template_element =
+      (new DOMParser()).parseFromString(xhr.responseText, "text/html");
+    parsed_html = renderJS.parseGadgetHTMLDocument(
+      tmp_constructor.__template_element,
+      url
+    );
+    for (key in parsed_html) {
+      if (parsed_html.hasOwnProperty(key)) {
+        tmp_constructor.prototype['__' + key] = parsed_html[key];
       }
-
-      return gadget_model_dict[url];
     }
+    return tmp_constructor;
+  }
 
-    if (gadget_model_dict.hasOwnProperty(url)) {
+  renderJS.declareGadgetKlass = function (url) {
+    if (gadget_model_defer_dict.hasOwnProperty(url)) {
       // Return klass object if it already exists
-      result = RSVP.resolve(gadget_model_dict[url]);
-    } else {
-      // Fetch the HTML page and parse it
-      result = new RSVP.Queue()
-        .push(function () {
-          return ajax(url);
-        })
-        .push(function (xhr) {
-          return parse(xhr);
-        });
+      return gadget_model_defer_dict[url].promise;
     }
-    return result;
+
+    var tmp_constructor,
+      defer = RSVP.defer();
+
+    gadget_model_defer_dict[url] = defer;
+
+    // Fetch the HTML page and parse it
+    return new RSVP.Queue()
+      .push(function () {
+        return ajax(url);
+      })
+      .push(function (result) {
+        tmp_constructor = parse(result, url);
+        var fragment = document.createDocumentFragment(),
+          promise_list = [],
+          i,
+          js_list = tmp_constructor.prototype.__required_js_list,
+          css_list = tmp_constructor.prototype.__required_css_list;
+        // Load JS
+        if (js_list.length) {
+          gadget_loading_klass_list.push(tmp_constructor);
+          for (i = 0; i < js_list.length - 1; i += 1) {
+            promise_list.push(renderJS.declareJS(js_list[i], fragment));
+          }
+          promise_list.push(renderJS.declareJS(js_list[i], fragment, true));
+        }
+        // Load CSS
+        for (i = 0; i < css_list.length; i += 1) {
+          promise_list.push(renderJS.declareCSS(css_list[i], fragment));
+        }
+        document.head.appendChild(fragment);
+        return RSVP.all(promise_list);
+      })
+      .push(function () {
+        defer.resolve(tmp_constructor);
+        return tmp_constructor;
+      })
+      .push(undefined, function (e) {
+        // Drop the current loading klass info used by selector
+        // even in case of error
+        defer.reject(e);
+        throw e;
+      });
   };
 
   /////////////////////////////////////////////////////////////////
@@ -1729,7 +1963,7 @@ function loopEventListener(target, type, useCapture, callback) {
   /////////////////////////////////////////////////////////////////
   // For test purpose only
   renderJS.clearGadgetKlassList = function () {
-    gadget_model_dict = {};
+    gadget_model_defer_dict = {};
     javascript_registration_dict = {};
     stylesheet_registration_dict = {};
   };
@@ -1797,420 +2031,386 @@ function loopEventListener(target, type, useCapture, callback) {
   // Bootstrap process. Register the self gadget.
   ///////////////////////////////////////////////////
 
-  function mergeSubDict(dict) {
-    var subkey,
-      subkey2,
-      subresult2,
-      value,
-      result = {};
-    for (subkey in dict) {
-      if (dict.hasOwnProperty(subkey)) {
-        value = dict[subkey];
-        if (value instanceof Object) {
-          subresult2 = mergeSubDict(value);
-          for (subkey2 in subresult2) {
-            if (subresult2.hasOwnProperty(subkey2)) {
-              // XXX key should not have an . inside
-              if (result.hasOwnProperty(subkey + "." + subkey2)) {
-                throw new Error("Key " + subkey + "." +
-                                subkey2 + " already present");
-              }
-              result[subkey + "." + subkey2] = subresult2[subkey2];
-            }
-          }
-        } else {
-          if (result.hasOwnProperty(subkey)) {
-            throw new Error("Key " + subkey + " already present");
-          }
-          result[subkey] = value;
-        }
+  // Detect when all JS dependencies have been loaded
+  all_dependency_loaded_deferred = new RSVP.defer();
+  // Manually initializes the self gadget if the DOMContentLoaded event
+  // is triggered before everything was ready.
+  // (For instance, the HTML-tag for the self gadget gets inserted after
+  //  page load)
+  renderJS.manualBootstrap = function () {
+    all_dependency_loaded_deferred.resolve();
+  };
+  document.addEventListener('DOMContentLoaded',
+                            all_dependency_loaded_deferred.resolve, false);
+
+  function configureMutationObserver(TmpConstructor, url, root_gadget) {
+    // XXX HTML properties can only be set when the DOM is fully loaded
+    var settings = renderJS.parseGadgetHTMLDocument(document, url),
+      j,
+      key,
+      fragment = document.createDocumentFragment();
+    for (key in settings) {
+      if (settings.hasOwnProperty(key)) {
+        TmpConstructor.prototype['__' + key] = settings[key];
       }
     }
-    return result;
+    TmpConstructor.__template_element = document.createElement("div");
+    root_gadget.element = document.body;
+    root_gadget.state = {};
+    for (j = 0; j < root_gadget.element.childNodes.length; j += 1) {
+      fragment.appendChild(
+        root_gadget.element.childNodes[j].cloneNode(true)
+      );
+    }
+    TmpConstructor.__template_element.appendChild(fragment);
+    return RSVP.all([root_gadget.getRequiredJSList(),
+              root_gadget.getRequiredCSSList()])
+      .then(function (all_list) {
+        var i,
+          js_list = all_list[0],
+          css_list = all_list[1];
+        for (i = 0; i < js_list.length; i += 1) {
+          javascript_registration_dict[js_list[i]] = null;
+        }
+        for (i = 0; i < css_list.length; i += 1) {
+          stylesheet_registration_dict[css_list[i]] = null;
+        }
+        gadget_loading_klass_list.shift();
+      }).then(function () {
 
+        // select the target node
+        var target = document.querySelector('body'),
+          // create an observer instance
+          observer = new MutationObserver(function (mutations) {
+            var i, k, len, len2, node, added_list;
+            mutations.forEach(function (mutation) {
+              if (mutation.type === 'childList') {
+
+                len = mutation.removedNodes.length;
+                for (i = 0; i < len; i += 1) {
+                  node = mutation.removedNodes[i];
+                  if (node.nodeType === Node.ELEMENT_NODE) {
+                    if (node.hasAttribute("data-gadget-url") &&
+                        (node._gadget !== undefined)) {
+                      createMonitor(node._gadget);
+                    }
+                    added_list =
+                      node.querySelectorAll("[data-gadget-url]");
+                    len2 = added_list.length;
+                    for (k = 0; k < len2; k += 1) {
+                      node = added_list[k];
+                      if (node._gadget !== undefined) {
+                        createMonitor(node._gadget);
+                      }
+                    }
+                  }
+                }
+
+                len = mutation.addedNodes.length;
+                for (i = 0; i < len; i += 1) {
+                  node = mutation.addedNodes[i];
+                  if (node.nodeType === Node.ELEMENT_NODE) {
+                    if (node.hasAttribute("data-gadget-url") &&
+                        (node._gadget !== undefined)) {
+                      if (document.contains(node)) {
+                        startService(node._gadget);
+                      }
+                    }
+                    added_list =
+                      node.querySelectorAll("[data-gadget-url]");
+                    len2 = added_list.length;
+                    for (k = 0; k < len2; k += 1) {
+                      node = added_list[k];
+                      if (document.contains(node)) {
+                        if (node._gadget !== undefined) {
+                          startService(node._gadget);
+                        }
+                      }
+                    }
+                  }
+                }
+
+              }
+            });
+          }),
+          // configuration of the observer:
+          config = {
+            childList: true,
+            subtree: true,
+            attributes: false,
+            characterData: false
+          };
+
+        // pass in the target node, as well as the observer options
+        observer.observe(target, config);
+
+        return root_gadget;
+      });
   }
 
-  function bootstrap() {
-    var url = removeHash(window.location.href),
-      tmp_constructor,
+  function createLastAcquisitionGadget() {
+    var last_acquisition_gadget = new RenderJSGadget();
+    last_acquisition_gadget.__acquired_method_dict = {
+      reportServiceError: function (param_list) {
+        letsCrash(param_list[0]);
+      }
+    };
+    // Stop acquisition on the last acquisition gadget
+    // Do not put this on the klass, as their could be multiple instances
+    last_acquisition_gadget.__aq_parent = function (method_name) {
+      throw new renderJS.AcquisitionError(
+        "No gadget provides " + method_name
+      );
+    };
+    return last_acquisition_gadget;
+  }
+
+/*
+  function notifyAllMethodToParent() {
+    ;
+  }
+*/
+
+  function createLoadingGadget(url) {
+    var TmpConstructor,
       root_gadget,
-      loading_gadget_promise = new RSVP.Queue(),
-      declare_method_count = 0,
       embedded_channel,
-      notifyReady,
       notifyDeclareMethod,
-      gadget_ready = false,
-      iframe_top_gadget,
-      last_acquisition_gadget;
+      declare_method_list_waiting,
+      loading_result,
+      channel_defer,
+      real_result_list;
+      // gadget_failed = false,
+      // connection_ready = false;
 
     // Create the gadget class for the current url
-    if (gadget_model_dict.hasOwnProperty(url)) {
+    if (gadget_model_defer_dict.hasOwnProperty(url)) {
       throw new Error("bootstrap should not be called twice");
     }
-    loading_klass_promise = new RSVP.Promise(function (resolve, reject) {
 
-      last_acquisition_gadget = new RenderJSGadget();
-      last_acquisition_gadget.__acquired_method_dict = {
-        getTopURL: function () {
-          return url;
-        },
-        reportServiceError: function (param_list) {
-          letsCrash(param_list[0]);
-        },
-        pleaseRedirectMyHash: function (param_list) {
-          window.location.replace(param_list[0]);
-        },
-        pleasePublishMyState: function (param_list) {
-          var key,
-            first = true,
-            hash = "#";
-          param_list[0] = mergeSubDict(param_list[0]);
-          for (key in param_list[0]) {
-            if (param_list[0].hasOwnProperty(key)) {
-              if (!first) {
-                hash += "&";
-              }
-              hash += encodeURIComponent(key) + "=" +
-                encodeURIComponent(param_list[0][key]);
-              first = false;
-            }
-          }
-          return hash;
-        }
-      };
-      // Stop acquisition on the last acquisition gadget
-      // Do not put this on the klass, as their could be multiple instances
-      last_acquisition_gadget.__aq_parent = function (method_name) {
-        throw new renderJS.AcquisitionError(
-          "No gadget provides " + method_name
-        );
-      };
+    // Create the root gadget instance and put it in the loading stack
+    TmpConstructor = RenderJSEmbeddedGadget;
+    TmpConstructor.__ready_list = RenderJSGadget.__ready_list.slice();
+    TmpConstructor.__service_list = RenderJSGadget.__service_list.slice();
+    TmpConstructor.prototype.__path = url;
+    root_gadget = new RenderJSEmbeddedGadget();
+    setAqParent(root_gadget, createLastAcquisitionGadget());
 
-      //we need to determine tmp_constructor's value before exit bootstrap
-      //because of function : renderJS
-      //but since the channel checking is async,
-      //we can't use code structure like:
-      // if channel communication is ok
-      //    tmp_constructor = RenderJSGadget
-      // else
-      //    tmp_constructor = RenderJSEmbeddedGadget
-      if (window.self === window.top) {
-        // XXX Copy/Paste from declareGadgetKlass
-        tmp_constructor = function () {
-          RenderJSGadget.call(this);
-        };
-        tmp_constructor.declareMethod = RenderJSGadget.declareMethod;
-        tmp_constructor.declareAcquiredMethod =
-          RenderJSGadget.declareAcquiredMethod;
-        tmp_constructor.allowPublicAcquisition =
-          RenderJSGadget.allowPublicAcquisition;
-        tmp_constructor.__ready_list = RenderJSGadget.__ready_list.slice();
-        tmp_constructor.ready = RenderJSGadget.ready;
-        tmp_constructor.__service_list = RenderJSGadget.__service_list.slice();
-        tmp_constructor.declareService =
-          RenderJSGadget.declareService;
-        tmp_constructor.prototype = new RenderJSGadget();
-        tmp_constructor.prototype.constructor = tmp_constructor;
-        tmp_constructor.prototype.__path = url;
-        gadget_model_dict[url] = tmp_constructor;
+    declare_method_list_waiting = [
+      "getInterfaceList",
+      "getRequiredCSSList",
+      "getRequiredJSList",
+      "getPath",
+      "getTitle"
+    ];
 
-        // Create the root gadget instance and put it in the loading stack
-        root_gadget = new gadget_model_dict[url]();
+    // Inform parent gadget about declareMethod calls here.
+    notifyDeclareMethod = function (name) {
+      declare_method_list_waiting.push(name);
+    };
 
-        tmp_constructor.declareService(function () {
-          return listenHashChange(this);
-        });
-
-        setAqParent(root_gadget, last_acquisition_gadget);
-
-      } else {
-        // Create the communication channel
-        embedded_channel = Channel.build({
-          window: window.parent,
-          origin: "*",
-          scope: "renderJS"
-        });
-        // Create the root gadget instance and put it in the loading stack
-        tmp_constructor = RenderJSEmbeddedGadget;
-        tmp_constructor.__ready_list = RenderJSGadget.__ready_list.slice();
-        tmp_constructor.__service_list = RenderJSGadget.__service_list.slice();
-        tmp_constructor.prototype.__path = url;
-        root_gadget = new RenderJSEmbeddedGadget();
-
-
-        // Notify parent about gadget instanciation
-        notifyReady = function () {
-          if ((declare_method_count === 0) && (gadget_ready === true)) {
-            embedded_channel.notify({method: "ready"});
-          }
-        };
-
-        // Inform parent gadget about declareMethod calls here.
-        notifyDeclareMethod = function (name) {
-          declare_method_count += 1;
-          embedded_channel.call({
-            method: "declareMethod",
-            params: name,
-            success: function () {
-              declare_method_count -= 1;
-              notifyReady();
-            },
-            error: function () {
-              declare_method_count -= 1;
-            }
-          });
-        };
-
-        notifyDeclareMethod("getInterfaceList");
-        notifyDeclareMethod("getRequiredCSSList");
-        notifyDeclareMethod("getRequiredJSList");
-        notifyDeclareMethod("getPath");
-        notifyDeclareMethod("getTitle");
-
-        // Surcharge declareMethod to inform parent window
-        tmp_constructor.declareMethod = function (name, callback) {
-          var result = RenderJSGadget.declareMethod.apply(
-              this,
-              [name, callback]
-            );
-          notifyDeclareMethod(name);
-          return result;
-        };
-
-        tmp_constructor.declareService =
-          RenderJSGadget.declareService;
-        tmp_constructor.declareAcquiredMethod =
-          RenderJSGadget.declareAcquiredMethod;
-        tmp_constructor.allowPublicAcquisition =
-          RenderJSGadget.allowPublicAcquisition;
-
-        //Default: Define __aq_parent to inform parent window
-        tmp_constructor.prototype.__aq_parent = function (method_name,
-          argument_list, time_out) {
-          return new RSVP.Promise(function (resolve, reject) {
-            embedded_channel.call({
-              method: "acquire",
-              params: [
-                method_name,
-                argument_list
-              ],
-              success: function (s) {
-                resolve(s);
-              },
-              error: function (e) {
-                reject(e);
-              },
-              timeout: time_out
-            });
-          });
-        };
-      }
-
-      tmp_constructor.prototype.__acquired_method_dict = {};
-      tmp_constructor.allowPublicAcquisition("pleasePublishMyState",
-                                             pleasePublishMyState);
-      gadget_loading_klass = tmp_constructor;
-
-      function init() {
-        // XXX HTML properties can only be set when the DOM is fully loaded
-        var settings = renderJS.parseGadgetHTMLDocument(document, url),
-          j,
-          key;
-        for (key in settings) {
-          if (settings.hasOwnProperty(key)) {
-            tmp_constructor.prototype['__' + key] = settings[key];
-          }
-        }
-        tmp_constructor.__template_element = document.createElement("div");
-        root_gadget.__element = document.body;
-        for (j = 0; j < root_gadget.__element.childNodes.length; j += 1) {
-          tmp_constructor.__template_element.appendChild(
-            root_gadget.__element.childNodes[j].cloneNode(true)
-          );
-        }
-        RSVP.all([root_gadget.getRequiredJSList(),
-                  root_gadget.getRequiredCSSList()])
-          .then(function (all_list) {
-            var i,
-              js_list = all_list[0],
-              css_list = all_list[1];
-            for (i = 0; i < js_list.length; i += 1) {
-              javascript_registration_dict[js_list[i]] = null;
-            }
-            for (i = 0; i < css_list.length; i += 1) {
-              stylesheet_registration_dict[css_list[i]] = null;
-            }
-            gadget_loading_klass = undefined;
-          }).then(function () {
-
-            // select the target node
-            var target = document.querySelector('body'),
-              // create an observer instance
-              observer = new MutationObserver(function (mutations) {
-                var i, k, len, len2, node, added_list;
-                mutations.forEach(function (mutation) {
-                  if (mutation.type === 'childList') {
-
-                    len = mutation.removedNodes.length;
-                    for (i = 0; i < len; i += 1) {
-                      node = mutation.removedNodes[i];
-                      if (node.nodeType === Node.ELEMENT_NODE) {
-                        if (node.hasAttribute("data-gadget-url") &&
-                            (node._gadget !== undefined)) {
-                          createMonitor(node._gadget);
-                        }
-                        added_list =
-                          node.querySelectorAll("[data-gadget-url]");
-                        len2 = added_list.length;
-                        for (k = 0; k < len2; k += 1) {
-                          node = added_list[k];
-                          if (node._gadget !== undefined) {
-                            createMonitor(node._gadget);
-                          }
-                        }
-                      }
-                    }
-
-                    len = mutation.addedNodes.length;
-                    for (i = 0; i < len; i += 1) {
-                      node = mutation.addedNodes[i];
-                      if (node.nodeType === Node.ELEMENT_NODE) {
-                        if (node.hasAttribute("data-gadget-url") &&
-                            (node._gadget !== undefined)) {
-                          if (document.contains(node)) {
-                            startService(node._gadget);
-                          }
-                        }
-                        added_list =
-                          node.querySelectorAll("[data-gadget-url]");
-                        len2 = added_list.length;
-                        for (k = 0; k < len2; k += 1) {
-                          node = added_list[k];
-                          if (document.contains(node)) {
-                            if (node._gadget !== undefined) {
-                              startService(node._gadget);
-                            }
-                          }
-                        }
-                      }
-                    }
-
-                  }
-                });
-              }),
-              // configuration of the observer:
-              config = {
-                childList: true,
-                subtree: true,
-                attributes: false,
-                characterData: false
-              };
-
-            // pass in the target node, as well as the observer options
-            observer.observe(target, config);
-
-            return root_gadget;
-          }).then(resolve, function (e) {
-            reject(e);
-            console.error(e);
-            throw e;
-          });
-      }
-      document.addEventListener('DOMContentLoaded', init, false);
-    });
-
-    loading_gadget_promise
-      .push(function () {
-        return loading_klass_promise;
-      })
-      .push(function (root_gadget) {
-        var i;
-
-        function ready_wrapper() {
-          return root_gadget;
-        }
-
-        if (window.top !== window.self) {
-          //checking channel should be done before sub gadget's declaration
-          //__ready_list:
-          //0: clearGadgetInternalParameters
-          //1: loadSubGadgetDOMDeclaration
-          //.....
-          tmp_constructor.__ready_list.splice(1, 0, function () {
-            return root_gadget.__aq_parent('getTopURL', [], 100)
-              .then(function (topURL) {
-                var base = document.createElement('base');
-                base.href = topURL;
-                base.target = "_top";
-                document.head.appendChild(base);
-                //the channel is ok
-                //so bind calls to renderJS method on the instance
-                embedded_channel.bind("methodCall", function (trans, v) {
-                  root_gadget[v[0]].apply(root_gadget, v[1])
-                    .then(function (g) {
-                      trans.complete(g);
-                    }).fail(function (e) {
-                      trans.error(e.toString());
-                    });
-                  trans.delayReturn(true);
+    real_result_list = [TmpConstructor, root_gadget, embedded_channel,
+                        declare_method_list_waiting];
+    if (window.self === window.top) {
+      loading_result = real_result_list;
+    } else {
+      channel_defer = RSVP.defer();
+      loading_result = RSVP.any([
+        channel_defer.promise,
+        new RSVP.Queue()
+          .push(function () {
+            // Expect the channel to parent to be usable after 1 second
+            // If not, consider the gadget as the root
+            // Drop all iframe channel communication
+            return RSVP.delay(1000);
+          })
+          .push(function () {
+            real_result_list[2] = undefined;
+            return real_result_list;
+          })
+      ]);
+      // Create the communication channel
+      embedded_channel = Channel.build({
+        window: window.parent,
+        origin: "*",
+        scope: "renderJS",
+        onReady: function () {
+          var k,
+            len;
+          // Channel is ready, so now declare all methods
+          notifyDeclareMethod = function (name) {
+            declare_method_list_waiting.push(
+              new RSVP.Promise(function (resolve, reject) {
+                embedded_channel.call({
+                  method: "declareMethod",
+                  params: name,
+                  success: resolve,
+                  error: reject
                 });
               })
-              .fail(function (error) {
-                if (error === "timeout_error") {
-                  //the channel fail
-                  //we consider current gadget is parent gadget
-                  //redifine last acquisition gadget
-                  iframe_top_gadget = true;
-                  tmp_constructor.declareService(function () {
-                    return listenHashChange(this);
-                  });
-                  setAqParent(root_gadget, last_acquisition_gadget);
-                } else {
-                  throw error;
-                }
-              });
-          });
-        }
+            );
+          };
 
-        tmp_constructor.ready(function (g) {
-          return startService(g);
-        });
+          len = declare_method_list_waiting.length;
+          for (k = 0; k < len; k += 1) {
+            notifyDeclareMethod(declare_method_list_waiting[k]);
+          }
 
-        loading_gadget_promise.push(ready_wrapper);
-        for (i = 0; i < tmp_constructor.__ready_list.length; i += 1) {
-          // Put a timeout?
-          loading_gadget_promise
-            .push(tmp_constructor.__ready_list[i])
-            // Always return the gadget instance after ready function
-            .push(ready_wrapper);
+          channel_defer.resolve(real_result_list);
         }
       });
-    if (window.self === window.top) {
-      loading_gadget_promise
-        .fail(function (e) {
-          letsCrash(e);
-          throw e;
-        });
-    } else {
-      // Inform parent window that gadget is correctly loaded
-      loading_gadget_promise
-        .then(function () {
-          gadget_ready = true;
-          notifyReady();
-        })
-        .fail(function (e) {
-          //top gadget in iframe
-          if (iframe_top_gadget) {
-            letsCrash(e);
-          } else {
-            embedded_channel.notify({method: "failed", params: e.toString()});
-          }
-          throw e;
-        });
+      real_result_list[2] = embedded_channel;
     }
 
+    // Surcharge declareMethod to inform parent window
+    TmpConstructor.declareMethod = function (name, callback) {
+      var result = RenderJSGadget.declareMethod.apply(
+          this,
+          [name, callback]
+        );
+      notifyDeclareMethod(name);
+      return result;
+    };
+
+    TmpConstructor.declareService =
+      RenderJSGadget.declareService;
+    TmpConstructor.declareJob =
+      RenderJSGadget.declareJob;
+    TmpConstructor.onEvent =
+      RenderJSGadget.onEvent;
+    TmpConstructor.onLoop =
+      RenderJSGadget.onLoop;
+    TmpConstructor.declareAcquiredMethod =
+      RenderJSGadget.declareAcquiredMethod;
+    TmpConstructor.allowPublicAcquisition =
+      RenderJSGadget.allowPublicAcquisition;
+
+    TmpConstructor.prototype.__acquired_method_dict = {};
+    gadget_loading_klass_list.push(TmpConstructor);
+
+    return loading_result;
   }
-  bootstrap();
+
+  function triggerReadyList(TmpConstructor, root_gadget) {
+    // XXX Probably duplicated
+    var i,
+      ready_queue = new RSVP.Queue();
+
+    function ready_wrapper() {
+      return root_gadget;
+    }
+    function ready_executable_wrapper(fct) {
+      return function (g) {
+        return fct.call(g, g);
+      };
+    }
+    TmpConstructor.ready(function () {
+      return startService(this);
+    });
+
+    ready_queue.push(ready_wrapper);
+    for (i = 0; i < TmpConstructor.__ready_list.length; i += 1) {
+      // Put a timeout?
+      ready_queue
+        .push(ready_executable_wrapper(TmpConstructor.__ready_list[i]))
+        // Always return the gadget instance after ready function
+        .push(ready_wrapper);
+    }
+    return ready_queue;
+  }
+
+  function finishAqParentConfiguration(TmpConstructor, root_gadget,
+                                       embedded_channel) {
+    // Define __aq_parent to inform parent window
+    root_gadget.__aq_parent =
+      TmpConstructor.prototype.__aq_parent = function (method_name,
+                                                       argument_list,
+                                                       time_out) {
+        return new RSVP.Promise(function (resolve, reject) {
+          embedded_channel.call({
+            method: "acquire",
+            params: [
+              method_name,
+              argument_list
+            ],
+            success: function (s) {
+              resolve(s);
+            },
+            error: function (e) {
+              reject(e);
+            },
+            timeout: time_out
+          });
+        });
+      };
+
+    // bind calls to renderJS method on the instance
+    embedded_channel.bind("methodCall", function (trans, v) {
+      root_gadget[v[0]].apply(root_gadget, v[1])
+        .push(function (g) {
+          trans.complete(g);
+        }, function (e) {
+          trans.error(e.toString());
+        });
+      trans.delayReturn(true);
+    });
+  }
+
+  function bootstrap(url) {
+    // Create the loading gadget
+    var wait_for_gadget_loaded = createLoadingGadget(url),
+      TmpConstructor,
+      root_gadget,
+      embedded_channel,
+      declare_method_list_waiting;
+
+    return new RSVP.Queue()
+      .push(function () {
+        // Wait for the loading gadget to be created
+        return wait_for_gadget_loaded;
+      })
+      .push(function (result_list) {
+        TmpConstructor = result_list[0];
+        root_gadget = result_list[1];
+        embedded_channel = result_list[2];
+        declare_method_list_waiting = result_list[3];
+        // Wait for all the gadget dependencies to be loaded
+        return all_dependency_loaded_deferred.promise;
+      })
+      .push(function () {
+        // Wait for all methods to be correctly declared
+        return RSVP.all(declare_method_list_waiting);
+      })
+      .push(function (result_list) {
+        if (embedded_channel !== undefined) {
+          finishAqParentConfiguration(TmpConstructor, root_gadget,
+                                      embedded_channel);
+        }
+        // Check all DOM modifications to correctly start/stop services
+        return configureMutationObserver(TmpConstructor, url, root_gadget);
+      })
+      .push(function () {
+        // Trigger all ready functions
+        return triggerReadyList(TmpConstructor, root_gadget);
+      })
+      .push(function () {
+        if (embedded_channel !== undefined) {
+          embedded_channel.notify({method: "ready"});
+        }
+      })
+      .push(undefined, function (e) {
+        letsCrash(e);
+        if (embedded_channel !== undefined) {
+          embedded_channel.notify({method: "failed", params: e.toString()});
+        }
+        throw e;
+      });
+  }
+
+  bootstrap(
+    removeHash(window.location.href)
+  );
 
 }(document, window, RSVP, DOMParser, Channel, MutationObserver, Node,
-  FileReader, Blob));
+  FileReader, Blob, navigator, Event, URL));
+  

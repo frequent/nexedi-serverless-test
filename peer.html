@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>Serverless WebRTC - Peer (Slave)</title>
+
+    <script src="rsvp.latest.js"></script>
+    <script src="renderjs.latest.js"></script>
+    <script src="peer.js"></script>
+
+  </head>
+  <body>
+    <h1>Peer (Slave) - connect and access remote database</h1>
+
+    <div class="ui-content">
+      <h2>Status:</h2>
+      <span class="ops-status"></span>
+    </div>
+
+    <div class="ui-content">
+      <div style="display:inline-block;width:49%;vertical-align:top">
+        <h2>Encoder</h2>
+        <ul>
+          <li>Generate WebRTC offers, encode and audio transmit.</li>
+          <li>Detecting a matching answer will enable WebRTC.</li>
+        </ul>
+        <h2>Token Generator/Encoded Payload</h2>
+        <textarea class="ops-encoder-input"></textarea>
+        <p>
+          <form name="ops-form-generate"><button type="submit">Generate</button></form>
+          <form name="ops-form-play"><button type="submit">Encode/Play</button></form>
+          <form name="ops-form-clear-encoder"><button type="submit">Reset</button></form>
+        </p>
+        <p>
+        <form name="ops-form-config">
+          <label>Bit high duration: <span>100</span> ms
+            <input name="ops-duration" class="ops-duration" type="range" value="100" min="10", max="1000", step="10">
+          </label>
+          <label>Pause between bytes: <span>20</span> ms
+            <input name="ops-pause" class="ops-pause" type="range" value="20" min="0", max="500", step="10">
+          </label>
+        </form>
+        </p>
+      </div>
+      <div style="display:inline-block;width:49%;vertical-align:top">
+        <h2>Decoder</h2>
+        <ul>
+          <li>Listens once offer has been sent</li>
+          <li>Tries to understand answer and establish WebRTC connection.</li>
+        </ul>
+        <h2>Received, Input</h2>
+        <code>0b00000000</code>
+        <textarea class="ops-decoder-output" readonly></textarea>
+        <p>
+          <form name="ops-form-listen"><button type="submit">Listen</button></form>
+          <form name="ops-form-connect"><button type="submit">Connect</button></form>
+          <form name="ops-form-clear-decoder"><button type="submit">Reset</button></form>
+        </p>
+        <p>
+          <form name="ops-form-config">
+          <label>Significant bin byte value threshold: <span>124</span>
+            <input name="ops-bin-value-threshold" class="ops-bin-value-threshold" type="range" value="124" min="1", max="255", step="1">
+          </label>
+          <label>Output after consecutive duplicate states: <span>10</span>
+            <input name="ops-duplicate-state-threshold" class="ops-duplicate-state-threshold" type="range" value="10" min="1", max="50", step="1">
+          </label>
+        </form>
+      </div>
+    </div>
+
+    <div class="ui-content">
+      <form name="ops-form-create">
+        <h3>Create Records</h3>
+        <label><span>First Name</span><input type="text" name="field_first_name" /></label>
+        <label><span>Last Name</span><input type="text" name="field_last_name" /></label>
+        <input type="submit" value="Create Record" />
+      </form>
+    </div>
+    <div class="ui-content">
+      <form name="ops-form-query">
+        <h3>Query Records</h3>
+        <label><span>Search</span><input type="search" name="field_search_string" /></label>
+        <input type="submit" value="Search For Names" />
+      </form>
+      <ul class="ops-result-list"></ul>
+    </div>
+    
+    <!-- master storage access -->
+    <div data-gadget-url="gadget_webrtc_access_storage.html"
+         data-gadget-scope="webrtc_access_storage"
+         data-gadget-sandbox="public"></div>
+
+  </body>
+</html>

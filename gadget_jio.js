@@ -1,4 +1,4 @@
-/*global window, rJS, jIO, FormData */
+/*global window, rJS, jIO */
 /*jslint indent: 2, maxerr: 3 */
 (function (window, rJS, jIO) {
   "use strict";
@@ -6,12 +6,15 @@
   rJS(window)
 
     .ready(function (gadget) {
-      // Initialize the gadget local parameters
       gadget.state_parameter_dict = {};
     })
+    .declareMethod('render', function () {
+      return this;
+    })
 
-    .declareMethod('createJio', function (jio_options) {
-      this.state_parameter_dict.jio_storage = jIO.createJIO(jio_options);
+    .declareMethod('createJIO', function () {
+      this.state_parameter_dict.jio_storage =
+        jIO.createJIO.apply(jIO, arguments);
     })
     .declareMethod('allDocs', function () {
       var storage = this.state_parameter_dict.jio_storage;

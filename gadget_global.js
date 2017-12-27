@@ -87,5 +87,4 @@
       reader.readAsText(file);
     });
   };
-
 }(window, RSVP, FileReader));
