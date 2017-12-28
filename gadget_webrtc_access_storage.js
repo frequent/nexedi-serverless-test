@@ -22,17 +22,18 @@
     "5": ".....", "6": "_....",   "7": "__...",   "8": "___..",
     "9": "____.", "0": "_____",
 
-    ".": "._._._",      // AAA, RK
-    "'": ".___.",       // WG
-    "!": "_._._____.",  // KW, MN
-    ")": "_.__._",      // NG, KN
-    "(": "_.__._",      // NQ, KK
-    "&": "._...",       // AS
-    ";": "_._._.",      // NNN, KR
-    '"': "._.._.",      // RR
-    "$": "..._.._",     // SX
-    "@": ".__._.",      // AC
-    "_": "..__._",      // UK
+    //".": "._._._",      // AAA, RK
+    //"'": ".___.",       // WG
+    //"!": "_._._____.",  // KW, MN
+    //")": "_.__._",      // NG, KN
+    //"(": "_.__._",      // NQ, KK
+    //"&": "._...",       // AS
+    //";": "_._._.",      // NNN, KR
+    //'"': "._.._.",      // RR
+    //"$": "..._.._",     // SX
+    //"@": ".__._.",      // AC
+    //"_": "..__._",      // UK
+    //";": ".____",       // ?
 
     ",": "__..__",      // MIM, GW
     "?": "..__..",      // IMI, UD
@@ -45,10 +46,11 @@
   };
 
   // tokens will be base64 encoded, so not all morse characters are used. Thus
-  // lowercase flag: '
+  // lowercase:
   var LOWER = ".____.";
-  // character separater: ;
-  var SPACE = "_._._.";
+
+  // character splitter:
+  var SPACE = ".___.";
 
   /////////////////////////////////////////////////////////////////
   // some methods
@@ -82,11 +84,12 @@
 
   function getCharacter(my_snip, my_upperbound) {
     var candidate = my_snip.substring(0, my_upperbound);
+    //console.log("testing candidate:", candidate, my_upperbound)
     if (candidate === LOWER) {
       return;
     }
     if (candidate.indexOf(LOWER) === 0) {
-      return findInMorse(candidate.substring(6)).toLowerCase();
+      return findInMorse(candidate.substring(LOWER.length)).toLowerCase();
     }
     return findInMorse(candidate);
   }
@@ -96,19 +99,26 @@
     return new Array(times + 1).join(str);
   }
 
-  function getLookAhead(my_code, my_i) {
-    var j = 0;
+  // match lookahead separators
+  function getLookAhead(my_code, my_i, my_snip) {
+    var j;
     var lookahead;
-    var match_string = "_.";
-    var len = my_code.length;
-    while (my_i < len) {
-      lookahead = my_code[my_i + j + 1] + my_code[my_i + j + 2];
-      if (lookahead === match_string) {
-        j += 2;
-      } else {
-        return j/2;
+    var candidate;
+    var match_string = SPACE;
+    var len = match_string.length;
+    var alternative_list = [my_i];
+
+    // shift by 1 and see if end is separator
+    if (my_i < my_code.length - 1) {
+      for (j = 1; j <= len; j += 1) {
+        lookahead = my_snip + my_code.substr(my_i + 1, j);
+        candidate = lookahead.substring(lookahead.length - match_string.length);
+        if (candidate === match_string) {
+          alternative_list.push(my_i + j);
+        }
       }
     }
+    return alternative_list;
   }
 
   function getSplitList(my_output, my_current_pos) {
@@ -132,8 +142,9 @@
   }
 
   function convertMorseToText(my_code) {
-    console.log(my_code, my_code.length)
+    //console.log(my_code)
     var len = my_code.length;
+    //console.log(len)
     var output = {};
     var character_position = 0;
     var snip = "";
@@ -147,6 +158,7 @@
     var character_total;
     var character_last;
     var result_list = [];
+    var option;
 
     while (i < len) {
       snip += my_code[i];
@@ -154,20 +166,18 @@
       breaker = getIndex(snip);
       if (breaker > -1) {
         output[character_position] = [];
-
-        // where does character end and separator start
-        character_options = 1 + getLookAhead(my_code, i);
-        for (j = 1; j <= character_options; j += 1) {
+        character_options = getLookAhead(my_code, i, snip);
+        //console.log(character_options)
+        for (j = 0; j < character_options.length; j += 1) {
+          option = character_options[j];
           node = {
-            "snip": snip + repeat("_.", j - 1),
+            "snip" : snip + my_code.substr(i + 1, option - i),
             "pos": character_position,
-            "i": i + (j - 1) * 2,
-            "shift": (j - 1) * 2
+            "i": i + option - i,
+            "shift": option - i
           };
-
           try {
             node.character = getCharacter(node.snip, breaker + node.shift);
-            
             // one candidate only (url:port) signals pending end
             if (node.pos > 80 && node.character === ":") {
               character_total = node.pos + 4;
@@ -181,8 +191,8 @@
             // wrong branches eventually result in unmatchable characters
             if (node.character === undefined) {
               continue;
-            } else {
-              console.log(character_position, node.snip, getCharacter(node.snip, breaker + node.shift), i, node.i)
+            //} else {
+            //  console.log(character_position, node.snip, getCharacter(node.snip, breaker + node.shift), i, node.i)
             }
           // unmatchable lowercase character throw
           } catch (e) {
@@ -190,86 +200,58 @@
           }
           output[character_position].push(node);
         }
-        if (character_total && node.pos === character_total) {
-          output[character_position].forEach(function (curr_char, index) {
-            if (curr_char.i !== len - 1) {
-              output[character_position].shift();
-              i = output[character_position][0].i;
-            }
-          });
-        }
 
-        // "N" rule, breaker on 0, get more tokens
-        if (breaker === 0 && output[character_position].length > 0) {
-          //console.log("ZERO BREAKER, continue from", output[character_position], output[character_position][0], output[character_position][0].i)
+        //if (character_total && node.pos === character_total) {
+        //  output[character_position].forEach(function (curr_char, index) {
+        //    if (curr_char.i !== len - 1) {
+        //      output[character_position].shift();
+        //      i = output[character_position][0].i;
+        //    }
+        //  });
+        //}
+
+        // keep on the left most branch until it fails
+        if (output[character_position].length > 0) {
+          //console.log("KEEP LEFT, continue from", output[character_position], output[character_position][0], output[character_position][0].i)
           i = output[character_position][0].i;
         }
+
+        // no options. go back to last split and remove branch
         if (output[character_position].length === 0) {
           split_list = getSplitList(output, character_position);
           relevant_split = split_list[0];
+          //console.log("NO OPTION, go back, split list", split_list, "relevant = ", relevant_split)
           if (relevant_split === undefined) {
-            console.log("we're done");
             break;
           }
-          console.log("DEADEND, pos", character_position, "i:", i, "relevant_split", relevant_split, "splits:",  getSplitList(output, character_position))
           output[relevant_split].shift();
           character_position = relevant_split;
           i = output[relevant_split][0].i;
-          console.log("setting to char-pos:", character_position, "character:", output[relevant_split][0].character, "i=", output[relevant_split][0].i)
+          //console.log("BACKTRACK TO LAST SPLITs:", character_position, "character:", output[relevant_split][0].character, "i=", output[relevant_split][0].i)
         }
+
         snip = "";
         character_position += 1;
+
         if (i === len - 1) {
           result_list.push(assembleToken(output));
+
           // continue from last split
           split_list = getSplitList(output, character_position);
-          console.log("EOF, splits left:", split_list)
           if (split_list.length === 0) {
-            console.log("we're done")
             break;
           } else {
             relevant_split = split_list[0];
             output[relevant_split].shift();
             character_position = relevant_split;
             i = output[relevant_split][0].i;
-            console.log("jumping back to char-pos:", character_position, "character:", output[relevant_split][0].character, "i=", output[relevant_split][0].i)
+            //console.log("EOF, JUMP BACK char-pos:", character_position, "character:", output[relevant_split][0].character, "i=", output[relevant_split][0].i)
           }
         }
       }
       i += 1;
     }
-    console.log(result_list)
-    // I don't know whether other options are valid, just because there are 
-    // splits left does not mean they work in combination. So to reduce the
-    // remaining options I would have to walk through the remaining tree again?
-    // and see whether there are any branches which do not work. Surely there
-    // are...
-    /*
-    var option_list = Object.keys(output).reduce(function (token_list, key) {
-      var clone_list = [];
-      var char_list = output[key].forEach(function (char) {
-        var skip;
-        token_list.forEach(function (token) {
-          token += char.character;
-          //if (token.length === 45) {
-          //  try {
-          //    binify(token.substring(2,46))
-          //  } catch (e) {
-          //    console.log("OUT", token.substring(2,46))
-          //    skip = e;
-          //  }
-          //}
-          //if (!skip) {
-          clone_list.push(token.slice(0));
-          //}
-        });  
-      });
-      return clone_list;
-      console.log(option_list)
-    }, ['']);
-    */
-    
-    
+    console.log(result_list);
   }
 
   function d2h (d) {
@@ -295,7 +277,7 @@
   }
 
   function decodeIp(my_str) {
-    var arr = []
+    var arr = [];
     var i;
     var len = my_str.length/2;
     var temp;
